@@ -1,0 +1,721 @@
+import warnings
+import datetime
+import time
+import traceback
+
+import numpy as np
+import pandas as pd
+from arch import arch_model
+from hmmlearn.hmm import GaussianHMM
+from pykalman import KalmanFilter
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools import add_constant
+from statsmodels.tsa.stattools import adfuller
+
+# ── FIX: đổi từ `vnstock` sang `vnstock_data` ──────────────────────────
+try:
+    from vnstock_data import Listing, Quote, Trading          # vnstock_data package
+except ImportError:
+    # fallback nếu chưa install vnstock_data, dùng vnstock gốc
+    from vnstock import Listing, Quote, Trading               # vnstock package
+
+warnings.filterwarnings("ignore")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ════════════════════════════════════════════════════════════════════════
+
+class Config:
+    HISTORY_START  = "2025-01-01"
+    HISTORY_END    = datetime.date.today().strftime("%Y-%m-%d")
+    TOP_N          = 50
+    SCAN_INTERVAL  = 60       # giây giữa mỗi scan
+    REFRESH_EVERY  = 60       # phút để re-fit cache
+
+    # Ornstein–Uhlenbeck
+    OU_ENTRY_Z    = 1.5
+    ADF_THRESHOLD = 0.10
+    MIN_HALF_LIFE = 2
+    MAX_HALF_LIFE = 40
+
+    # HMM
+    HMM_N_STATES  = 3
+    HMM_WINDOW    = 150
+    HMM_ITER      = 200
+
+    # Kalman Filter
+    KF_OBS_NOISE   = 1.0
+    KF_TRANS_NOISE = 0.01
+
+    # Risk management
+    STOP_PCT      = 0.05
+    GARCH_WINDOW  = 120
+    MIN_HISTORY   = 60        # ngưỡng tối thiểu số phiên
+
+    FALLBACK_TICKERS = [
+        "VCB","BID","CTG","TCB","MBB","VPB","ACB","HDB","STB","TPB",
+        "VIC","VHM","MSN","MWG","FPT","HPG","VNM","GAS","PLX","VJC",
+        "SSI","VND","HCM","PDR","NVL","KDH","DGC","DCM","REE","PNJ",
+        "VRE","BCM","SAB","BVH","SHB","EIB","LPB","OCB","NAB","BAB",
+        "VHC","MSB","VCI","BSI","AGR","DXG","HDG","IJC","DIG","CEO",
+    ]
+
+REGIME_EMOJI = {"Bull": "🐂", "Bear": "🐻", "Sideways": "🦀", "UNKNOWN": "❓"}
+TREND_EMOJI  = {"Tăng": "↗",  "Giảm": "↘",  "Ngang": "→"}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ════════════════════════════════════════════════════════════════════════
+
+def now_str()   -> str: return datetime.datetime.now().strftime("%H:%M:%S")
+def today_str() -> str: return datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+
+def flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            "_".join(str(v) for v in col if v).strip("_").lower()
+            for col in df.columns
+        ]
+    else:
+        df.columns = [str(c).lower().strip() for c in df.columns]
+    return df
+
+def find_col(df: pd.DataFrame, *keywords: str) -> str:
+    for kw in keywords:
+        hits = [c for c in df.columns if kw.lower() in c.lower()]
+        if hits:
+            return hits[0]
+    raise KeyError(f"Không tìm thấy cột {keywords}. Có: {list(df.columns)}")
+
+def safe_call(fn, retries: int = 3, delay: int = 5, label: str = ""):
+    """Gọi fn với retry tự động, trả None nếu thất bại."""
+    for attempt in range(1, retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            print(f"  ⚠ [{label}] lần {attempt}/{retries}: {type(exc).__name__} – chờ {delay}s…")
+            time.sleep(delay)
+    return None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# DATA LAYER
+# ════════════════════════════════════════════════════════════════════════
+
+def get_top_tickers() -> list[str]:
+    """Lấy top TOP_N mã HOSE theo accumulated volume trong ngày."""
+    print(f"[{now_str()}] Lấy top {Config.TOP_N} tickers…")
+
+    all_sym = safe_call(
+        lambda: Listing(source="VCI").all_symbols().pipe(
+            lambda d: d.rename(columns=str.lower)
+        ),
+        label="listing",
+    )
+    if all_sym is None:
+        print(f"  ⚠ Dùng fallback {Config.TOP_N} tickers")
+        return Config.FALLBACK_TICKERS[: Config.TOP_N]
+
+    # Tìm cột symbol và cột exchange
+    sym_col = next((c for c in all_sym.columns if "symbol" in c or "ticker" in c), all_sym.columns[0])
+    hose: list[str] = []
+    for col in ["comgroupcode", "exchange", "organtypecode", "type"]:
+        if col in all_sym.columns:
+            hose = all_sym[all_sym[col].str.upper() == "HOSE"][sym_col].tolist()
+            if len(hose) > 10:
+                break
+    if len(hose) < 10:
+        hose = all_sym[sym_col].tolist()
+
+    # Lấy price board theo batch 20 để tính volume
+    snaps: list[pd.DataFrame] = []
+    for i in range(0, min(len(hose), 150), 20):
+        batch = hose[i : i + 20]
+        snap = safe_call(
+            lambda b=batch: flatten_cols(Trading(source="VCI").price_board(b)),
+            retries=2, delay=3, label=f"pb_{i//20}",
+        )
+        if snap is not None and len(snap) > 0:
+            snaps.append(snap)
+        time.sleep(1.5)
+
+    if not snaps:
+        return Config.FALLBACK_TICKERS[: Config.TOP_N]
+
+    combined = pd.concat(snaps, ignore_index=True)
+    try:
+        vol_col = find_col(combined, "accumulated_volume", "totalvolume", "volume", "vol")
+        sym_col = find_col(combined, "symbol", "ticker", "code")
+    except KeyError:
+        return Config.FALLBACK_TICKERS[: Config.TOP_N]
+
+    combined[vol_col] = pd.to_numeric(combined[vol_col], errors="coerce")
+    top = (
+        combined.dropna(subset=[vol_col])
+        .sort_values(vol_col, ascending=False)
+        .head(Config.TOP_N)[sym_col]
+        .tolist()
+    )
+    print(f"[{now_str()}] ✓ {len(top)} tickers: {top}")
+    return top
+
+
+def load_price_matrix(symbols: list[str]) -> pd.DataFrame:
+    """Tải lịch sử giá đóng cửa, trả về DataFrame index=date, col=symbol."""
+    print(f"[{now_str()}] Tải lịch sử {len(symbols)} symbols [{Config.HISTORY_START} → {Config.HISTORY_END}]…")
+    dfs: list[pd.DataFrame] = []
+
+    for idx, sym in enumerate(symbols, 1):
+        def _fetch(s=sym):
+            df = Quote(symbol=s, source="VCI").history(
+                start=Config.HISTORY_START, end=Config.HISTORY_END, interval="1D"
+            )
+            df.columns = [c.lower() for c in df.columns]
+            t_col = find_col(df, "time", "date", "datetime")
+            c_col = find_col(df, "close")
+            df[t_col] = pd.to_datetime(df[t_col])
+            out = df.set_index(t_col)[[c_col]].rename(columns={c_col: s})
+            out[s] = pd.to_numeric(out[s], errors="coerce")
+            return out if len(out) >= Config.MIN_HISTORY else None
+
+        result = safe_call(_fetch, retries=3, delay=3, label=sym)
+        if result is not None:
+            dfs.append(result)
+        print(f"  [{idx:2d}/{len(symbols)}] {sym} {'✓' if result is not None else '✗'}")
+        time.sleep(1.0)
+
+    if not dfs:
+        raise RuntimeError("Không tải được dữ liệu giá!")
+
+    matrix = pd.concat(dfs, axis=1).sort_index().ffill().bfill()
+    print(
+        f"[{now_str()}] ✓ Matrix: {matrix.shape} "
+        f"({matrix.index[0].date()} → {matrix.index[-1].date()})"
+    )
+    return matrix
+
+
+def get_snapshot(symbols: list[str]) -> pd.DataFrame | None:
+    """Lấy giá real-time từ price board."""
+    snaps: list[pd.DataFrame] = []
+    for i in range(0, len(symbols), 20):
+        batch = symbols[i : i + 20]
+        snap = safe_call(
+            lambda b=batch: flatten_cols(Trading(source="VCI").price_board(b)),
+            retries=2, delay=3, label="snapshot",
+        )
+        if snap is not None and len(snap) > 0:
+            snaps.append(snap)
+        time.sleep(0.8)
+
+    if not snaps:
+        return None
+    df = pd.concat(snaps, ignore_index=True)
+    df["timestamp"] = datetime.datetime.now()
+    return df
+
+
+# ════════════════════════════════════════════════════════════════════════
+# QUANTITATIVE MODELS
+# ════════════════════════════════════════════════════════════════════════
+
+def fit_ou(log_prices: np.ndarray) -> dict:
+    """Fit Ornstein–Uhlenbeck via OLS, trả dict các tham số."""
+    X   = add_constant(log_prices[:-1])
+    res = OLS(log_prices[1:], X).fit()
+    alpha, beta = res.params
+
+    if not (0 < beta < 1):
+        raise ValueError(f"β={beta:.4f} ∉ (0,1)")
+
+    theta     = float(-np.log(beta))
+    mu        = float(alpha / (1 - beta))
+    resid_std = float(np.std(res.resid))
+    sigma     = max(resid_std * np.sqrt(2 * theta / (1 - np.exp(-2 * theta))), 1e-8)
+    half_life = float(np.log(2) / theta)
+    sigma_eq  = sigma / np.sqrt(2 * theta)
+
+    return {
+        "theta": theta, "mu": mu, "sigma": sigma,
+        "sigma_eq": sigma_eq, "half_life": half_life,
+    }
+
+
+def fit_hmm(log_returns: np.ndarray) -> dict:
+    """Fit Gaussian HMM 3 trạng thái (Bear/Sideways/Bull)."""
+    r = log_returns.reshape(-1, 1)
+    if len(r) < 40:
+        return {
+            "regime": "UNKNOWN", "prob": 0.0,
+            "bull_prob": 0.0, "bear_prob": 0.0, "side_prob": 0.0,
+        }
+
+    r_fit = r[-Config.HMM_WINDOW :]
+    model = GaussianHMM(
+        n_components=Config.HMM_N_STATES, covariance_type="full",
+        n_iter=Config.HMM_ITER, random_state=42, tol=1e-4,
+    )
+    model.fit(r_fit)
+
+    means      = model.means_.flatten()
+    idx        = np.argsort(means)
+    bear_s, side_s, bull_s = idx[0], idx[1], idx[2]
+    labels     = {bear_s: "Bear", side_s: "Sideways", bull_s: "Bull"}
+
+    probs         = model.predict_proba(r_fit)
+    current_state = model.predict(r_fit)[-1]
+    cp            = probs[-1]
+
+    return {
+        "regime":    labels[current_state],
+        "prob":      round(float(cp[current_state]), 3),
+        "bull_prob": round(float(cp[bull_s]), 3),
+        "bear_prob": round(float(cp[bear_s]), 3),
+        "side_prob": round(float(cp[side_s]), 3),
+    }
+
+
+def fit_kalman(prices: np.ndarray) -> dict:
+    """Áp dụng Kalman Filter 1D, trả giá lọc + z-score + trend."""
+    kf = KalmanFilter(
+        transition_matrices=[[1]], observation_matrices=[[1]],
+        initial_state_mean=[prices[0]], initial_state_covariance=[[1]],
+        observation_covariance=[[Config.KF_OBS_NOISE]],
+        transition_covariance=[[Config.KF_TRANS_NOISE]],
+    )
+    filtered, _ = kf.filter(prices.reshape(-1, 1))
+    filtered     = filtered.flatten()
+
+    residuals  = prices - filtered
+    resid_std  = max(
+        np.std(residuals[-60:]) if len(residuals) >= 60 else np.std(residuals), 1e-8
+    )
+    kf_z       = float((prices[-1] - filtered[-1]) / resid_std)
+    win        = min(20, len(filtered))
+    slope      = float(np.polyfit(np.arange(win), filtered[-win:], 1)[0])
+    slope_pct  = slope / filtered[-win] * 100
+    trend      = "Tăng" if slope_pct > 0.1 else ("Giảm" if slope_pct < -0.1 else "Ngang")
+
+    return {
+        "kf_price":  float(filtered[-1]),
+        "kf_z":      round(kf_z, 3),
+        "trend":     trend,
+        "slope_pct": round(slope_pct, 4),
+    }
+
+
+def fit_garch(returns: pd.Series) -> float:
+    """Dự báo volatility annualized (%) từ GARCH(1,1)."""
+    r = returns.dropna() * 100
+    if len(r) < 60:
+        return np.nan
+    try:
+        gm = arch_model(r, vol="Garch", p=1, q=1, rescale=False)
+        gf = gm.fit(disp="off", show_warning=False, options={"maxiter": 200})
+        fc = gf.forecast(horizon=1, reindex=False)
+        return float(np.sqrt(fc.variance.iloc[-1, 0]) / 100 * np.sqrt(252) * 100)
+    except Exception:
+        return np.nan
+
+
+# ════════════════════════════════════════════════════════════════════════
+# CACHE
+# ════════════════════════════════════════════════════════════════════════
+
+def build_cache(price_matrix: pd.DataFrame) -> dict:
+    """Fit OU + HMM + Kalman + GARCH cho mỗi symbol, lưu vào cache."""
+    print(f"[{now_str()}] Fitting models cho {len(price_matrix.columns)} symbols…")
+    cache   = {}
+    log_ret = np.log(price_matrix / price_matrix.shift(1)).dropna()
+
+    for sym in price_matrix.columns:
+        prices  = price_matrix[sym].dropna().values
+        returns = log_ret[sym].dropna().values
+        if len(prices) < Config.MIN_HISTORY:
+            continue
+
+        try:
+            adf_p = adfuller(np.log(prices), autolag="AIC")[1]
+            if adf_p > Config.ADF_THRESHOLD:
+                continue
+
+            ou = fit_ou(np.log(prices))
+            if not (Config.MIN_HALF_LIFE <= ou["half_life"] <= Config.MAX_HALF_LIFE):
+                continue
+
+            hmm  = fit_hmm(returns)
+            kf   = fit_kalman(prices)
+            gvol = fit_garch(pd.Series(returns[-Config.GARCH_WINDOW :]))
+
+            cache[sym] = {
+                "ou": ou, "hmm": hmm, "kf": kf,
+                "adf_p":     round(float(adf_p), 4),
+                "price_eq":  float(np.exp(ou["mu"])),
+                "garch_vol": gvol,
+            }
+            print(
+                f"  {sym} ✓  hl={ou['half_life']:.0f}d  "
+                f"regime={hmm['regime']}  trend={kf['trend']}",
+                end="\r",
+            )
+        except Exception:
+            continue
+
+    print(f"\n[{now_str()}] ✓ {len(cache)}/{len(price_matrix.columns)} symbols fitted")
+    return cache
+
+
+# ════════════════════════════════════════════════════════════════════════
+# SIGNAL ENGINE
+# ════════════════════════════════════════════════════════════════════════
+
+def compute_signals(
+    snap: pd.DataFrame,
+    cache: dict,
+    price_history: pd.DataFrame,
+    sym_col: str,
+    price_col: str,
+) -> pd.DataFrame:
+    rows: list[dict] = []
+
+    for _, row in snap.iterrows():
+        sym = row.get(sym_col)
+        if sym not in cache:
+            continue
+        try:
+            price = float(row[price_col])
+            if not price or price <= 0 or np.isnan(price):
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        m      = cache[sym]
+        ou     = m["ou"]
+        kf     = m["kf"]
+        hmm    = m["hmm"]
+        regime = hmm["regime"]
+
+        ou_z = (np.log(price) - ou["mu"]) / max(ou["sigma_eq"], 1e-8)
+        kf_z = (price - kf["kf_price"]) / max(abs(kf["kf_price"]) * 0.01, 1e-8)
+
+        bear_dom = regime == "Bear"  and hmm["bear_prob"] > 0.7
+        bull_dom = regime == "Bull"  and hmm["bull_prob"] > 0.7
+
+        if   ou_z < -Config.OU_ENTRY_Z and kf_z < 0 and not bear_dom: signal = "LONG"
+        elif ou_z >  Config.OU_ENTRY_Z and kf_z > 0 and not bull_dom: signal = "SHORT"
+        else:                                                            signal = "FLAT"
+
+        tick      = max(100, round(price * 0.002 / 100) * 100)
+        price_eq  = m["price_eq"]
+        target    = round(price_eq / tick) * tick
+        stop_mult = (1 - Config.STOP_PCT) if signal == "LONG" else (1 + Config.STOP_PCT)
+        stop      = round(price * stop_mult / tick) * tick
+        if signal == "FLAT":
+            target = stop = price
+
+        upside = abs(target - price) / price * 100
+        risk   = abs(stop - price) / price * 100
+        rr     = round(upside / max(risk, 0.01), 2)
+
+        mom20 = ""
+        if sym in price_history.columns:
+            hist = price_history[sym].dropna()
+            if len(hist) >= 20:
+                v     = (hist.iloc[-1] / hist.iloc[-20] - 1) * 100
+                mom20 = f"{'+' if v >= 0 else ''}{v:.1f}%"
+
+        rows.append({
+            "symbol":    sym,
+            "signal":    signal,
+            "price":     int(price),
+            "ou_z":      round(ou_z, 3),
+            "kf_z":      round(kf_z, 3),
+            "half_life": round(ou["half_life"], 1),
+            "price_eq":  int(price_eq),
+            "kf_price":  int(kf["kf_price"]),
+            "kf_trend":  kf["trend"],
+            "regime":    regime,
+            "bull_p":    hmm["bull_prob"],
+            "bear_p":    hmm["bear_prob"],
+            "side_p":    hmm["side_prob"],
+            "garch_vol": round(m["garch_vol"], 1) if not np.isnan(m["garch_vol"]) else 0.0,
+            "target":    int(target),
+            "stop":      int(stop),
+            "upside":    round(upside, 2),
+            "risk":      round(risk, 2),
+            "rr":        rr,
+            "mom20":     mom20,
+            "adf_p":     m["adf_p"],
+        })
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("ou_z").reset_index(drop=True)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# REPORT FORMATTER
+# ════════════════════════════════════════════════════════════════════════
+
+def _stars(r: dict) -> str:
+    s  = 3 if abs(r["ou_z"]) >= 2.5 else (2 if abs(r["ou_z"]) >= 2.0 else 1)
+    s += (2 if r["regime"] == "Sideways"
+          else 2 if r["signal"] == "LONG"  and r["regime"] == "Bull"
+          else 2 if r["signal"] == "SHORT" and r["regime"] == "Bear"
+          else 0)
+    s += 2 if abs(r["kf_z"]) > 1.0 else (1 if abs(r["kf_z"]) > 0.5 else 0)
+    s += 2 if r["rr"] >= 2.5 else (1 if r["rr"] >= 1.5 else 0)
+    if r["adf_p"] < 0.01: s += 1
+    return ["⭐","⭐⭐","⭐⭐","⭐⭐⭐","⭐⭐⭐⭐","⭐⭐⭐⭐⭐"][min(s // 2, 5)]
+
+def _confidence(r: dict) -> str:
+    score  = 2 if abs(r["ou_z"]) >= 2.5 else (1 if abs(r["ou_z"]) >= 2.0 else 0)
+    score += 2 if abs(r["kf_z"]) >= 1.0 else (1 if abs(r["kf_z"]) >= 0.5 else 0)
+    if r["signal"] == "LONG"  and r["regime"] in ("Bull", "Sideways"): score += 2
+    if r["signal"] == "SHORT" and r["regime"] in ("Bear", "Sideways"): score += 2
+    return {6:"RẤT CAO 🔥",5:"RẤT CAO 🔥",4:"CAO ✅",3:"CAO ✅",
+            2:"TRUNG BÌNH ⚠️"}.get(score, "THẤP 🔻")
+
+def _ou_line(ou_z: float, signal: str) -> str:
+    direction = "dưới" if ou_z < 0 else "trên"
+    strength  = "cực mạnh" if abs(ou_z) >= 3 else ("mạnh" if abs(ou_z) >= 2 else "vừa")
+    state     = "oversold" if signal == "LONG" else "overbought"
+    return f"OU z-score = {ou_z:+.2f}σ → giá lệch {strength} {direction} cân bằng → {state}"
+
+def _kf_line(kf_z: float, trend: str, signal: str) -> str:
+    tr_em = TREND_EMOJI.get(trend, "→")
+    state = "oversold" if signal == "LONG" else "overbought"
+    sym   = "≪" if kf_z < 0 else "≫"
+    if abs(kf_z) >= 0.5:
+        return f"Kalman Filter z {sym} 0 → xác nhận {state} {tr_em} xu hướng {trend.lower()}"
+    return f"Kalman Filter z = {kf_z:+.2f} → tín hiệu yếu, xu hướng {trend.lower()}"
+
+def _hmm_line(r: dict) -> str:
+    regime = r["regime"]
+    signal = r["signal"]
+    re_em  = REGIME_EMOJI.get(regime, "❓")
+    bp, brp, sp = r["bull_p"], r["bear_p"], r["side_p"]
+    if regime == "Sideways":
+        return f"HMM regime: {re_em} Sideways (~{sp*100:.0f}%) → lý tưởng cho mean reversion"
+    if regime == "Bull":
+        note = "thuận chiều ✓" if signal == "LONG" else "ngược trend → giảm size, scalp only"
+        return f"HMM regime: {re_em} Bull (~{bp*100:.0f}%) → {note}"
+    if regime == "Bear":
+        note = "thuận chiều ✓" if signal == "SHORT" else "ngược trend → stop chặt, size nhỏ"
+        return f"HMM regime: {re_em} Bear (~{brp*100:.0f}%) → {note}"
+    return "HMM regime: ❓ Không xác định → thận trọng"
+
+def _adf_line(adf_p: float) -> str:
+    if adf_p < 0.01:
+        return f"ADF p = {adf_p} → stationary rõ ràng ✓ (mean reversion rất đáng tin)"
+    if adf_p < 0.05:
+        return f"ADF p = {adf_p} → stationary ✓ (mean reversion đáng tin)"
+    return f"ADF p ≈ {adf_p} → có dấu hiệu stationarity, cần xác nhận thêm"
+
+def _build_warnings(r: dict) -> list[str]:
+    warns = []
+    gv    = r["garch_vol"]
+    if   gv >= 50: warns.append(f"⚠ Volatility rất cao (GARCH ~{gv:.0f}%/năm) → size nhỏ, không giữ qua đêm")
+    elif gv >= 30: warns.append(f"ℹ Volatility cao (GARCH ~{gv:.0f}%/năm) → không nên giữ position lớn")
+    if r["regime"] == "Bear"  and r["signal"] == "LONG":
+        warns.append("⚠ Ngược xu hướng Bear → size ≤ 50% bình thường, stop chặt")
+    if r["regime"] == "Bull"  and r["signal"] == "SHORT":
+        warns.append("⚠ Ngược xu hướng Bull → chỉ scalp, không giữ qua đêm")
+    if r["adf_p"] >= 0.05:
+        warns.append("⚠ Mean reversion yếu → chờ thêm tín hiệu xác nhận")
+    if r["mom20"]:
+        try:
+            mv = float(r["mom20"].replace("%", "").replace("+", ""))
+            if r["signal"] == "LONG"  and mv < -10:
+                warns.append(f"ℹ Momentum 20 ngày âm mạnh ({r['mom20']}) → có thể cần tích lũy thêm")
+            if r["signal"] == "SHORT" and mv >  10:
+                warns.append(f"ℹ Momentum 20 ngày dương mạnh ({r['mom20']}) → dòng tiền vẫn đang mua")
+        except ValueError:
+            pass
+    return warns
+
+def format_report(row: pd.Series) -> str:
+    r = row.to_dict()
+    if r["signal"] not in ("LONG", "SHORT"):
+        return ""
+
+    sig    = r["signal"]
+    price  = r["price"]
+    tick   = max(100, round(price * 0.002 / 100) * 100)
+
+    # Entry zone
+    if sig == "LONG":
+        e_lo, e_hi   = int(price * 0.995 / tick) * tick, int(price * 1.003 / tick) * tick
+        action_label = "🟢 LONG / MUA"
+        entry_label  = "Entry (mua) "
+    else:
+        e_lo, e_hi   = int(price * 0.997 / tick) * tick, int(price * 1.005 / tick) * tick
+        action_label = "🔴 SHORT / BÁN"
+        entry_label  = "Entry (bán) "
+
+    # Target range ±2%
+    t_lo = int(r["target"] * 0.98 / tick) * tick
+    t_hi = int(r["target"] * 1.02 / tick) * tick
+
+    rr_lo = round(r["rr"] * 0.85, 1)
+    rr_hi = round(r["rr"] * 1.10, 1)
+    warns = _build_warnings(r)
+
+    lines = [
+        f"{'━'*54}",
+        f"  Khuyến nghị giao dịch – {r['symbol']}  {_stars(r)}",
+        f"  Tín hiệu   : {action_label}",
+        f"  Độ tin cậy : {_confidence(r)}  |  📅 {today_str()}",
+        f"{'─'*54}",
+        "",
+        f"  📖 Lý do tín hiệu",
+        f"  {'·'*48}",
+        f"  • {_ou_line(r['ou_z'], sig)}",
+        f"  • {_kf_line(r['kf_z'], r['kf_trend'], sig)}",
+        f"  • {_hmm_line(r)}",
+        f"  • {_adf_line(r['adf_p'])}",
+        "",
+        f"  📌 Chiến lược giao dịch",
+        f"  {'·'*48}",
+        f"  {entry_label}        : ~{e_lo:,} – {e_hi:,} VND",
+        f"  Target (mean-reversion): vùng {t_lo:,} – {t_hi:,} VND",
+        f"                           (EQ = {r['price_eq']:,} | dự kiến ~{r['half_life']:.0f} phiên)",
+        f"  Stop-loss              : ~{r['stop']:,} VND",
+        "",
+        f"  📊 Risk / Reward",
+        f"  {'·'*48}",
+        f"  Upside kỳ vọng : ~{r['upside']:.1f}%",
+        f"  Risk           : ~{r['risk']:.1f}%",
+        f"  R/R            : ~1 : {rr_lo} – {rr_hi}",
+        f"  Thời gian giữ  : ~{r['half_life']:.0f} phiên giao dịch",
+        f"  Mom(20d)       : {r['mom20'] or 'N/A'}",
+    ]
+
+    if warns:
+        lines += ["", f"  ⚡ Lưu ý", f"  {'·'*48}"]
+        lines += [f"  {w}" for w in warns]
+
+    lines.append(f"{'━'*54}")
+    return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# CONSOLE SUMMARY
+# ════════════════════════════════════════════════════════════════════════
+
+def print_summary(df: pd.DataFrame, loop_n: int, n_sym: int, n_cache: int) -> None:
+    longs  = df[df["signal"] == "LONG"]
+    shorts = df[df["signal"] == "SHORT"]
+    flats  = df[df["signal"] == "FLAT"]
+
+    print(f"\n{'═'*54}")
+    print(f"  Scan #{loop_n}  |  {today_str()}")
+    print(f"  Scanned: {n_sym}   Fitted: {n_cache}")
+    print(f"  🟢 LONG: {len(longs)}   🔴 SHORT: {len(shorts)}   ⚪ FLAT: {len(flats)}")
+    print(f"{'═'*54}")
+
+    active = pd.concat([longs, shorts])
+    if active.empty:
+        print("  ⚪ Không có tín hiệu\n")
+        return
+
+    # Quick-glance table
+    cols = ["symbol","signal","price","ou_z","kf_z","regime","kf_trend","target","rr"]
+    print(active[cols].to_string(index=False))
+    print()
+
+    # Detailed reports
+    for _, row in active.iterrows():
+        rpt = format_report(row)
+        if rpt:
+            print(rpt + "\n")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# MAIN
+# ════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    print(f"\n{'═'*54}")
+    print(f"  VN Quant Scanner  —  OU + HMM + Kalman Filter")
+    print(f"  Data  : {Config.HISTORY_START} → {Config.HISTORY_END}")
+    print(f"  Top   : {Config.TOP_N} HOSE  |  Interval: {Config.SCAN_INTERVAL}s")
+    print(f"{'═'*54}\n")
+
+    # ── Khởi tạo ──
+    symbols      = get_top_tickers()
+    price_matrix = load_price_matrix(symbols)
+    cache        = build_cache(price_matrix)
+
+    if not cache:
+        print("❌ 0 symbol qua filter. Thử tăng ADF_THRESHOLD hoặc MAX_HALF_LIFE.")
+        return
+
+    # ── Detect column names từ snapshot test ──
+    test_snap = get_snapshot(symbols[:5])
+    if test_snap is None:
+        print("❌ Không lấy được snapshot")
+        return
+
+    try:
+        sym_col   = find_col(test_snap, "symbol", "ticker", "code")
+        price_col = find_col(test_snap, "match_price", "matchprice", "close", "price")
+        print(f"[{now_str()}] ✓ col sym='{sym_col}'  price='{price_col}'\n")
+    except KeyError as exc:
+        print(f"❌ {exc}")
+        return
+
+    # ── Main loop ──
+    all_snapshots: list[pd.DataFrame] = []
+    refresh_at = datetime.datetime.now() + datetime.timedelta(minutes=Config.REFRESH_EVERY)
+    loop_n     = 0
+
+    try:
+        while True:
+            loop_n += 1
+            snap = get_snapshot(symbols)
+
+            if snap is None:
+                print(f"[{now_str()}] ⚠ Snapshot lỗi – chờ {Config.SCAN_INTERVAL}s")
+                time.sleep(Config.SCAN_INTERVAL)
+                continue
+
+            all_snapshots.append(snap)
+            df_sig = compute_signals(snap, cache, price_matrix, sym_col, price_col)
+
+            if df_sig.empty:
+                print(f"[{now_str()}] #{loop_n} — không compute được signal")
+            else:
+                print_summary(df_sig, loop_n, len(symbols), len(cache))
+                df_sig["timestamp"] = datetime.datetime.now()
+                df_sig.to_csv("signals_latest.csv", index=False)
+                print(f"  💾 signals_latest.csv")
+
+            # Refresh cache định kỳ
+            if datetime.datetime.now() >= refresh_at:
+                print(f"\n[{now_str()}] 🔄 Refresh cache…")
+                try:
+                    symbols      = get_top_tickers()
+                    price_matrix = load_price_matrix(symbols)
+                    cache        = build_cache(price_matrix)
+                    refresh_at   = datetime.datetime.now() + datetime.timedelta(minutes=Config.REFRESH_EVERY)
+                except Exception as exc:
+                    print(f"  ⚠ Refresh lỗi: {exc}")
+
+            time.sleep(Config.SCAN_INTERVAL)
+
+    except KeyboardInterrupt:
+        print(f"\n[{now_str()}] Dừng. Lưu snapshot…")
+        if all_snapshots:
+            pd.concat(all_snapshots, ignore_index=True).to_csv("snapshots_full.csv", index=False)
+            print("  💾 snapshots_full.csv")
+
+    except Exception as exc:
+        print(f"\n❌ Lỗi: {exc}")
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
